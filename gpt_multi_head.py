@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
+dropout = 0.2  # dropout rate
+n_head = 4  # number of attention heads
 batch_size = 32
 block_size = 8
 max_iters = 5000
@@ -11,7 +13,6 @@ learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 32
-
 
 # ------------
 
@@ -65,12 +66,11 @@ class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
-        # YOUR CODE
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B,T,C = x.shape
@@ -82,11 +82,57 @@ class Head(nn.Module):
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         # normalize
         weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)  # Apply dropout after softmax
         # perform weighted aggregation of values
         v = self.value(x) # (B,T,head_size)
         out = weights @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
         return out
 
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)  # Apply dropout after projection
+        return out
+
+class FeedForward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Dropout(dropout),  # Apply dropout after ReLU
+            nn.Linear(4 * n_embd, n_embd)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))  # Skip connection with layer norm
+        x = x + self.ffwd(self.ln2(x))  # Skip connection with layer norm
+        return x
 
 class BigramLanguageModel(nn.Module):
 
@@ -94,7 +140,12 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = Head(n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4)
+        )
+        self.ln_f = nn.LayerNorm(n_embd)  # Final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -104,7 +155,8 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        x = self.sa_head(x) # (B,T,C)
+        x = self.blocks(x)  # Apply transformer blocks
+        x = self.ln_f(x)  # Final layer norm
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
@@ -143,7 +195,6 @@ print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
 for iter in range(max_iters):
-
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
@@ -157,7 +208,6 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-
 
 # generate from the model
 prompt = torch.tensor(encode(['\n'])).to(device)
